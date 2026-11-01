@@ -1,0 +1,198 @@
+Public Function SpeechSupported() As Boolean
+    #If TargetMac Then
+        Return True
+    #Else
+        Return False
+    #End If
+End Function
+
+#If TargetMac Then
+    Private Declare Function NativeClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+    Private Declare Function Allocate Lib "Foundation" Selector "alloc" (cls As Ptr) As Ptr
+    Private Declare Function InitObject Lib "Foundation" Selector "init" (object As Ptr) As Ptr
+    Private Declare Function NewPool Lib "Foundation" Selector "new" (cls As Ptr) As Ptr
+    Private Declare Sub DrainPool Lib "Foundation" Selector "drain" (pool As Ptr)
+    Private Declare Sub ReleaseObject Lib "CoreFoundation" Alias "CFRelease" (value As Ptr)
+    Private Function NativeText(value As Ptr) As String
+        If value = Nil Then Return ""
+        Return CType(CType(value, CFStringRef), String)
+    End Function
+    Private Declare Function ArrayCount Lib "Foundation" Selector "count" (nativeArray As Ptr) As Integer
+    Private Declare Function ArrayItem Lib "Foundation" Selector "objectAtIndex:" (nativeArray As Ptr, index As Integer) As Ptr
+    Private Function CopyStrings(nativeArray As Ptr) As Array Of String
+        Dim outputValue As Array Of String = []
+        If nativeArray = Nil Then Return outputValue
+        For i As Integer = 0 To ArrayCount(nativeArray) - 1
+            Array.Append(outputValue, NativeText(ArrayItem(nativeArray, i)))
+        Next
+        Return outputValue
+    End Function
+    Private Declare Function LoadFramework Lib "c" Alias "dlopen" (filePath As String, loadFlags As Int32) As Ptr
+    Private Declare Function Voices Lib "Foundation" Selector "speechVoices" (cls As Ptr) As Ptr
+    Private Declare Function VoiceLanguage Lib "Foundation" Selector "language" (voice As Ptr) As Ptr
+    Private Declare Function VoiceIdentifier Lib "Foundation" Selector "identifier" (voice As Ptr) As Ptr
+    Private Declare Function VoiceName Lib "Foundation" Selector "name" (voice As Ptr) As Ptr
+    Private Declare Function VoiceForLanguage Lib "Foundation" Selector "voiceWithLanguage:" (cls As Ptr, language As Ptr) As Ptr
+    Private Declare Function Utterance Lib "Foundation" Selector "speechUtteranceWithString:" (cls As Ptr, text As Ptr) As Ptr
+    Private Declare Sub SetVoice Lib "Foundation" Selector "setVoice:" (utterance As Ptr, voice As Ptr)
+    Private Declare Sub SpeakNative Lib "Foundation" Selector "speakUtterance:" (synth As Ptr, utterance As Ptr)
+    Private Declare Function StopNative Lib "Foundation" Selector "stopSpeakingAtBoundary:" (synth As Ptr, boundary As Integer) As UInt8
+    Private Declare Function Speaking Lib "Foundation" Selector "isSpeaking" (synth As Ptr) As UInt8
+    Private Class SpeechFramework
+        Public Shared Property Handle As Ptr = Nil
+    End Class
+    Private Function SynthClass() As Ptr
+        If SpeechFramework.Handle = Nil Then SpeechFramework.Handle = LoadFramework("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", 1)
+        Dim cls As Ptr = NativeClass("AVSpeechSynthesizer")
+        If cls = Nil Then Throw New UnsupportedOperationException("AV speech synthesis is unavailable")
+        Return cls
+    End Function
+    Private Declare Function IsMain Lib "Foundation" Selector "isMainThread" (cls As Ptr) As UInt8
+    Private Sub RequireMain()
+        If IsMain(NativeClass("NSThread")) = 0 Then Throw New InvalidArgumentException("Audio controls require the main thread")
+    End Sub
+    Private Class SpeechAudioCleanup
+        Public Shared Property Guard As Mutex = New Mutex()
+        Public Shared Property Pending As Array Of Ptr = []
+    End Class
+    Private Sub DisposeAudio(value As Ptr)
+        StopNative(value, 0)
+        ReleaseObject(value)
+    End Sub
+    Private Sub DrainSpeechAudioCleanup()
+        Dim pending As Array Of Ptr = []
+        SyncLock SpeechAudioCleanup.Guard
+            pending = SpeechAudioCleanup.Pending
+            SpeechAudioCleanup.Pending = []
+        End SyncLock
+        For Each value As Ptr In pending
+            DisposeAudio(value)
+        Next
+    End Sub
+    Private Sub RetireAudio(value As Ptr)
+        If value = Nil Then Return
+        If IsMain(NativeClass("NSThread")) <> 0 Then
+            DisposeAudio(value)
+        Else
+            SyncLock SpeechAudioCleanup.Guard
+                Array.Append(SpeechAudioCleanup.Pending, value)
+            End SyncLock
+            MainThread.InvokeAsync(AddressOf DrainSpeechAudioCleanup)
+        End If
+    End Sub
+#End If
+
+
+Public Class SpeechVoice
+    Private Property mIdentifier As String = ""
+    Public Property Identifier As String
+        Get
+            Return Me.mIdentifier
+        End Get
+    End Property
+    Private Property mName As String = ""
+    Public Property Name As String
+        Get
+            Return Me.mName
+        End Get
+    End Property
+    Private Property mLanguage As String = ""
+    Public Property Language As String
+        Get
+            Return Me.mLanguage
+        End Get
+    End Property
+    Public Sub Constructor(identifier As String, name As String, language As String)
+        Me.mIdentifier = identifier
+        Me.mName = name
+        Me.mLanguage = language
+    End Sub
+End Class
+
+Public Function SpeechVoices() As Array Of SpeechVoice
+    #If TargetMac Then
+        RequireMain()
+        SynthClass()
+        Dim pool As Ptr = NewPool(NativeClass("NSAutoreleasePool"))
+        Try
+            Dim values As Ptr = Voices(NativeClass("AVSpeechSynthesisVoice"))
+            Dim outputValue As Array Of SpeechVoice = []
+            For i As Integer = 0 To ArrayCount(values) - 1
+                Dim voice As Ptr = ArrayItem(values, i)
+                Array.Append(outputValue, New SpeechVoice(NativeText(VoiceIdentifier(voice)), NativeText(VoiceName(voice)), NativeText(VoiceLanguage(voice))))
+            Next
+            Return outputValue
+        Finally
+            DrainPool(pool)
+        End Try
+    #Else
+        Throw New UnsupportedOperationException("Speech synthesis requires macOS")
+    #End If
+End Function
+
+Public Class SpeechPlayer
+    Private Property Synth As Ptr = Nil
+    Private Property Closed As Boolean = False
+    Public Sub Constructor()
+        #If TargetMac Then
+            RequireMain()
+            Me.Synth = InitObject(Allocate(SynthClass()))
+            If Me.Synth = Nil Then Throw New Exception("Speech synthesizer could not be created")
+        #Else
+            Throw New UnsupportedOperationException("Speech synthesis requires macOS")
+        #End If
+    End Sub
+    Public Sub Speak(text As String, language As String = "")
+        If Me.Closed Then Throw New InvalidArgumentException("Speech player is closed")
+        If String.Trim(text) = "" Then Throw New InvalidArgumentException("Speech text is empty")
+        #If TargetMac Then
+            RequireMain()
+            Dim pool As Ptr = NewPool(NativeClass("NSAutoreleasePool"))
+            Dim textValue As CFStringRef = CType(text, CFStringRef)
+            Dim languageValue As CFStringRef = CType(language, CFStringRef)
+            Try
+                Dim value As Ptr = Utterance(NativeClass("AVSpeechUtterance"), textValue)
+                If language <> "" Then
+                    Dim voice As Ptr = VoiceForLanguage(NativeClass("AVSpeechSynthesisVoice"), languageValue)
+                    If voice = Nil Then Throw New InvalidArgumentException("No installed voice supports this language")
+                    SetVoice(value, voice)
+                End If
+                SpeakNative(Me.Synth, value)
+            Finally
+                ReleaseObject(textValue)
+                ReleaseObject(languageValue)
+                DrainPool(pool)
+            End Try
+        #End If
+    End Sub
+    Public Property IsSpeaking As Boolean
+        Get
+            If Me.Closed Then Return False
+            #If TargetMac Then
+                RequireMain()
+                Return Speaking(Me.Synth) <> 0
+            #Else
+                Return False
+            #End If
+        End Get
+    End Property
+    Public Sub Stop()
+        If Me.Closed Then Return
+        #If TargetMac Then
+            RequireMain()
+            StopNative(Me.Synth, 0)
+        #End If
+    End Sub
+    Public Sub Close()
+        If Me.Closed Then Return
+        Me.Closed = True
+        #If TargetMac Then
+            Dim value As Ptr = Me.Synth
+            Me.Synth = Nil
+            RetireAudio(value)
+        #End If
+    End Sub
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+End Class
